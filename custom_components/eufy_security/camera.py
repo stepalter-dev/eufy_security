@@ -128,12 +128,20 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
     async def _start_hass_streaming(self):
         await wait_for_value_to_equal(self.product.__dict__, "stream_status", StreamStatus.STREAMING)
         if self.product.stream_provider == StreamProvider.P2P:
-            # Wait for our own RTSP-push producer to have actually gotten one access unit
-            # into go2rtc before letting HA's Stream (or the snapshot poll below) attach as
-            # a consumer. go2rtc appears to destabilize a freshly-ANNOUNCEd producer if a
-            # consumer connects before it's producing data - see Eufy Integration Log
-            # 2026-08-27 for how this was diagnosed.
-            await wait_for_value_to_equal(self.product.p2p_streamer.__dict__, "first_push_ok", True)
+            # Wait for go2rtc to actually confirm our RTSP-push producer registered
+            # (announced_ok) before letting HA's Stream (or the snapshot poll below)
+            # attach as a consumer. first_push_ok only confirms our own write into
+            # ffmpeg's stdin succeeded - it says nothing about whether ffmpeg's
+            # ANNOUNCE has reached go2rtc yet, so it doesn't close the actual race
+            # window: a consumer's DESCRIBE landing while go2rtc is still appending
+            # our pushed producer to its internal list crashes the whole go2rtc
+            # process (a real go2rtc v1.9.14 upstream bug - unsynchronized read/
+            # append on Stream.producers in AddConsumer/AddProducer). Waiting for
+            # announced_ok instead means that append has already happened by the
+            # time any consumer attaches. See Eufy Integration Log 2026-08-28
+            # (continued 8) for the full diagnosis; 2026-08-27 for the earlier,
+            # weaker first_push_ok guard this replaces.
+            await wait_for_value_to_equal(self.product.p2p_streamer.__dict__, "announced_ok", True)
         await self._stop_hass_streaming()
         await self.async_create_stream()
         if self.stream is not None:

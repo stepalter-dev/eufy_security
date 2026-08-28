@@ -85,6 +85,12 @@ class P2PStreamer:
         # safeguard even though it turned out not to be the cause of that version's
         # failure (see module docstring).
         self.first_push_ok = False
+        # Set once go2rtc's own stream registry actually shows our ffmpeg's pushed
+        # producer registered (producers list length >= 2: the self-referencing
+        # placeholder from _register_stream plus our ffmpeg's "external" push) -
+        # see _wait_for_producer_registered for why this, not first_push_ok, is
+        # the signal HA's own consumers should wait on before attaching.
+        self.announced_ok = False
         self._proc: subprocess.Popen | None = None
 
     # ---------------------------------------------------------------------
@@ -153,6 +159,42 @@ class P2PStreamer:
             async with session.put(url, params={"name": name, "src": self_src}) as response:
                 result = response.status, await response.text()
                 _LOGGER.debug(f"_register_stream - put response {result}")
+
+    async def _wait_for_producer_registered(self, name: str, timeout_seconds: float) -> bool:
+        """Poll go2rtc's own stream info until our ffmpeg's pushed producer has
+        actually landed in its registry (producers list length >= 2: the
+        self-referencing placeholder from _register_stream plus our ffmpeg's
+        "external" push, added via go2rtc's internal AddProducer on ANNOUNCE).
+
+        This exists to close the highest-risk window of a real go2rtc v1.9.14
+        upstream bug (see Eufy Integration Log, 2026-08-28 continued 8): a
+        consumer's DESCRIBE (AddConsumer) racing against our ANNOUNCE
+        (AddProducer) appending to go2rtc's internal producers slice - both
+        read/mutate it without a shared lock - panics and crashes the entire
+        go2rtc process (`index out of range` in internal/streams/add_consumer.go).
+        Once this returns True, that append has already happened for this
+        cycle, so a consumer attaching afterward is no longer racing it (until
+        the connection breaks and a fresh retry cycle re-ANNOUNCEs). Not a fix
+        for the underlying go2rtc bug - that's out of our control - just a way
+        to avoid handing HA's own consumers a stream that's still mid-registration.
+        """
+        url, shared_session = self._go2rtc_api_url()
+        deadline = time.monotonic() + timeout_seconds
+        async with contextlib.AsyncExitStack() as stack:
+            session = shared_session or await stack.enter_async_context(aiohttp.ClientSession())
+            while time.monotonic() < deadline:
+                try:
+                    async with session.get(url, params={"src": name}) as response:
+                        if response.status == 200:
+                            data = await response.json(content_type=None)
+                            producers = data.get("producers", []) if isinstance(data, dict) else []
+                            if len(producers) >= 2:
+                                return True
+                except Exception as ex:  # pylint: disable=broad-except
+                    _LOGGER.debug(f"_wait_for_producer_registered {name} - poll error: {ex!r}")
+                await asyncio.sleep(0.1)
+        _LOGGER.debug(f"_wait_for_producer_registered {name} - timed out waiting for producer registration")
+        return False
 
     # ---------------------------------------------------------------------
     # ffmpeg subprocess push - blocking, runs in its own thread (via
@@ -287,6 +329,11 @@ class P2PStreamer:
         finally:
             self._teardown()
 
+    async def _mark_when_producer_registered(self, name: str) -> None:
+        self.announced_ok = False
+        if await self._wait_for_producer_registered(name, STREAM_TIMEOUT_SECONDS):
+            self.announced_ok = True
+
     async def start(self):
         """start streaming thread"""
         self.retry = None
@@ -297,4 +344,7 @@ class P2PStreamer:
         # number).
         name = str(self.camera.serial_no)
         host, port = self._rtsp_host_port()
-        await asyncio.to_thread(self._run, self.camera.video_queue, name, host, port)
+        await asyncio.gather(
+            asyncio.to_thread(self._run, self.camera.video_queue, name, host, port),
+            self._mark_when_producer_registered(name),
+        )
