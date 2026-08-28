@@ -98,7 +98,26 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
         # ffmpeg entities
         self.ffmpeg = self.coordinator.hass.data[DATA_FFMPEG]
 
+        # Serializes concurrent auto-start attempts (see _ensure_streaming_for_view) -
+        # async_camera_image() can be called several times a second while HA's
+        # default MJPEG handler is polling for frames, and without this guard each
+        # of those calls landing before the first one finishes starting the stream
+        # would try to call async_turn_on() again too.
+        self._auto_start_lock = asyncio.Lock()
+
     async def stream_source(self) -> str:
+        # Deliberately does NOT auto-start here (see _ensure_streaming_for_view,
+        # hooked into async_camera_image instead): handle_async_mjpeg_stream()
+        # below calls this first and only falls through to HA's default,
+        # async_camera_image()-based MJPEG relay when this returns None. If
+        # this auto-started and returned a real URL instead, every live-view
+        # request would take the CameraMjpeg()+ffmpeg direct-proxy path below
+        # instead - a second, separately-opened RTSP consumer per request that
+        # hasn't been exercised or tested today, and which is exactly the kind
+        # of short-lived-consumer churn flagged elsewhere as having previously
+        # destabilized the push (see Eufy Integration Log, 2026-08-27). Staying
+        # None here keeps live-view traffic on the already-tested
+        # async_camera_image() path, which does auto-start.
         if self.is_streaming is False:
             return None
         return self.product.stream_url
@@ -166,6 +185,37 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
     def extra_state_attributes(self):
         return {"stream_debug": self.product.stream_debug}
 
+    # Requests narrower than this are almost certainly dashboard/area-card
+    # thumbnail polling (observed ~175px wide) rather than someone actually
+    # opening the live view (observed ~1024px wide for a full snapshot, and no
+    # width at all - None - for the raw MJPEG live stream, since HA's default
+    # handle_async_mjpeg_stream() calls async_camera_image() with no size args).
+    _AUTO_START_MIN_WIDTH = 300
+
+    async def _ensure_streaming_for_view(self, width: int | None) -> None:
+        """Auto-start the live P2P/RTSP session on demand when something actually
+        requests a real view of this camera - the dashboard live-view dialog, or
+        camera_proxy_stream's continuous MJPEG feed - instead of requiring a
+        separate explicit `camera.turn_on` call first.
+
+        Deliberately skips narrow (thumbnail-sized) requests: without this, an
+        always-on wall dashboard showing an area card with this camera's small
+        preview thumbnail would keep calling async_camera_image() on its own
+        refresh cadence and re-trigger camera.turn_on indefinitely, defeating
+        the whole reason P2P sessions are gated behind on/off in the first
+        place (Eufy's cloud/P2P livestream is a real, limited resource, not a
+        free-running feed). See Eufy Integration Log, 2026-08-28 (continued 12).
+        """
+        if self.is_streaming:
+            return
+        if width is not None and width < self._AUTO_START_MIN_WIDTH:
+            return
+        async with self._auto_start_lock:
+            if self.is_streaming:  # another concurrent call may have started it already
+                return
+            _LOGGER.debug(f"_ensure_streaming_for_view - auto-starting (width={width})")
+            await self.async_turn_on()
+
     async def _get_image_from_stream_url(self, width, height):
         while True:
             result = await ffmpeg.async_get_image(self.hass, await self.stream_source(), width=width, height=height)
@@ -177,6 +227,7 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         _LOGGER.debug(f"image 1 - {self.is_streaming} - {self.stream}")
+        await self._ensure_streaming_for_view(width)
         if self.is_streaming is True:
             if self.stream is not None:
                 # Reuse HA's own already-connected Stream instead of opening a brand new
