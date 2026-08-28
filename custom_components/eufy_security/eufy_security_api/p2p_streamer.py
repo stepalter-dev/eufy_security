@@ -8,15 +8,22 @@ already uses to pull the stream back out - so a client still has to speak that
 handshake and RTP packetization (RFC 6184) correctly. An earlier version of this
 module hand-rolled that handshake and RTP packetization directly in Python: the
 handshake completed reliably (ANNOUNCE/SETUP/RECORD all 200 every time), but go2rtc
-dropped the connection within milliseconds of every real RTP write, and three
-separate rounds of protocol-level fixes - correcting the SETUP/RECORD channel
-negotiation, adding proper SDP codec parameters (profile-level-id,
-sprop-parameter-sets), and ruling out a race with consumers attaching before the
-producer had sent anything - each tested clean individually and none changed the
-outcome (see the Eufy Integration Log entries for 2026-08-27 for the full
-diagnostic trail). Rather than keep debugging a hand-rolled RTSP/RTP client against
-an opaque go2rtc-side failure, this version hands the whole ANNOUNCE/RECORD/RTP job
-to ffmpeg's own well-tested RTSP muxer instead.
+dropped the connection within milliseconds of every real RTP write. Rather than keep
+debugging a hand-rolled RTSP/RTP client, this version hands the whole
+ANNOUNCE/RECORD/RTP job to ffmpeg's own well-tested RTSP muxer instead.
+
+ROOT CAUSE of the "handshake succeeds, connection dies immediately" failure
+(found 2026-08-28, see Eufy Integration Log for the full diagnostic trail,
+including a synthetic-RTP-injection test that proved it wasn't a client-timing
+race): `_register_stream()` used to PUT to go2rtc's /api/streams with only a
+`name` param, no `src`. go2rtc's own handler (internal/streams/api.go) silently
+no-ops that request - an early-return guard fires before the PUT case ever runs
+when `src` is empty - so no *Stream* ever actually lands in go2rtc's registry,
+even though the HTTP response looks like success. When ffmpeg's ANNOUNCE then
+arrives, go2rtc's RTSP server (internal/rtsp/rtsp.go) finds no registered stream
+for that name and skips ever calling the code path that reads RTP off the
+socket, closing the connection right after RECORD's 200 OK instead. Fixed by
+registering with a self-referencing `src` (see `_register_stream` for detail).
 
 Historically (before either of the above) this integration pushed video via a raw
 HTTP POST to an `/api/stream` (singular) endpoint that doesn't exist on any current
@@ -82,9 +89,8 @@ class P2PStreamer:
 
     # ---------------------------------------------------------------------
     # go2rtc /api/streams registration - reuses HA's own go2rtc session when
-    # available (see Camera.set_go2rtc_client). Registers an empty
-    # placeholder-free stream, ready for ffmpeg's RTSP producer to ANNOUNCE
-    # into, instead of the old dead `tcp://127.0.0.1:65535` address.
+    # available (see Camera.set_go2rtc_client). See _register_stream for why
+    # a self-referencing `src` is required.
     # ---------------------------------------------------------------------
 
     def _go2rtc_api_url(self, suffix: str = "") -> tuple[str, aiohttp.ClientSession | None]:
@@ -101,21 +107,50 @@ class P2PStreamer:
         return host, port
 
     async def _register_stream(self) -> None:
-        """(Re)create an empty stream entry in go2rtc, ready to accept our RTSP producer."""
+        """(Re)create a stream entry in go2rtc, ready to accept our RTSP producer.
+
+        ROOT CAUSE (2026-08-28): this used to PUT with only a `name` param, no
+        `src`. go2rtc's own /api/streams handler (internal/streams/api.go) has an
+        early-return guard - `if src == "" && r.Method != "POST"` - that fires
+        before the PUT case's `New(name, ...)` ever runs, so that call was a no-op
+        that happened to return 200 with the current streams list (looking like
+        success). Because no *Stream ever landed in go2rtc's registry,
+        `streams.Get(name)` returned nil when our ffmpeg's RTSP ANNOUNCE arrived
+        (internal/rtsp/rtsp.go's tcpHandler), which left `closer` unset - so the
+        RTSP handshake completed in full (OPTIONS/ANNOUNCE/SETUP/RECORD all 200)
+        but `conn.Handle()` (the call that actually reads RTP off the socket) was
+        skipped entirely, and the connection was torn down immediately after
+        RECORD's 200 OK. Confirmed via a synthetic-RTP-injection test (Eufy
+        Integration Log, 2026-08-28): even a protocol-valid RTP frame written
+        immediately after RECORD's response got dropped with the exact same
+        byte-count EOF as real ffmpeg traffic - proving the closure was
+        independent of any client-side timing, i.e. structural, not a race.
+
+        Fix: register with a self-referencing `src` (an RTSP pull URL pointing at
+        our own push endpoint for this same stream name). This satisfies
+        `HasProducer()`/`Validate()` so `New()` actually creates the *Stream* and
+        stores it in go2rtc's registry. The URL is never dialed at registration
+        time (go2rtc's producers are lazy - see internal/streams/stream.go
+        `NewProducer`); it's only used as a fallback if a consumer requests the
+        stream before our own RTSP push has ANNOUNCEd (in which case dialing
+        it just fails harmlessly, since nothing is listening on that exact path
+        as a producer yet). Once our ffmpeg pushes in, `AddProducer` registers
+        that connection as `external` alongside the lazy pull source.
+        """
         url, shared_session = self._go2rtc_api_url()
-        parameters = {"name": str(self.camera.serial_no)}
+        name = str(self.camera.serial_no)
+        host, port = self._rtsp_host_port()
+        self_src = f"rtsp://{host}:{port}/{name}"
 
         async with contextlib.AsyncExitStack() as stack:
             session = shared_session or await stack.enter_async_context(aiohttp.ClientSession())
-            async with session.delete(url, params=parameters) as response:
+            async with session.delete(url, params={"name": name}) as response:
                 result = response.status, await response.text()
                 _LOGGER.debug(f"_register_stream - delete response {result}")
 
         async with contextlib.AsyncExitStack() as stack:
             session = shared_session or await stack.enter_async_context(aiohttp.ClientSession())
-            # No `src` - creates an empty stream, ready for a producer to ANNOUNCE into,
-            # instead of a `src` go2rtc would try to actively dial itself.
-            async with session.put(url, params=parameters) as response:
+            async with session.put(url, params={"name": name, "src": self_src}) as response:
                 result = response.status, await response.text()
                 _LOGGER.debug(f"_register_stream - put response {result}")
 
@@ -128,22 +163,10 @@ class P2PStreamer:
         """Launch ffmpeg reading raw Annex-B H.264 from stdin and pushing it into
         go2rtc's RTSP producer endpoint. No re-encoding - `-c:v copy` just remuxes."""
         binary = self.camera.ffmpeg_binary or "ffmpeg"
-        # RULED OUT (2026-08-28): a `?timeout=` query param on this URL was tried as
-        # a way to raise go2rtc's passive-producer read-timeout, on the theory that
-        # timeout was the mechanism behind the recurring Broken Pipe. `?timeout=3`
-        # and `?timeout=60` both produced the *same* ~1.7-2.1s Broken Pipe interval -
-        # if the declared value actually controlled anything, those would differ by
-        # 20x. Conclusion: the query param isn't reaching/affecting go2rtc's timeout
-        # at all (ffmpeg may not preserve it in the actual ANNOUNCE request line, or
-        # go2rtc's query parsing doesn't apply to producer connections the way it
-        # does for consumers) - and its mere presence seems to trigger a different,
-        # *shorter-lived* failure than the plain URL does. Reverted to no query
-        # string, which empirically gives the longest hold time observed so far
-        # (~6-8s). See Eufy Integration Log 2026-08-28 for the full timing data.
         url = f"rtsp://{host}:{port}/{name}"
         cmd = [
             binary,
-            "-loglevel", "debug",
+            "-loglevel", "warning",
             "-f", "h264",
             "-i", "pipe:0",
             "-c:v", "copy",
@@ -239,11 +262,13 @@ class P2PStreamer:
                 self.retry = False
                 return
 
-    def _run(self, queue, name):
-        """Thread entry point: launch ffmpeg, then push the queue's bytes into it."""
+    def _run(self, queue, name, connect_host: str, connect_port: int):
+        """Thread entry point: launch ffmpeg, then push the queue's bytes into it.
+        `connect_host`/`connect_port` is what ffmpeg actually dials - go2rtc's
+        real RTSP port (see start())."""
         self.retry = None
         self.first_push_ok = False
-        host, port = self._rtsp_host_port()
+        host, port = connect_host, connect_port
 
         self._wait_for_keyframe(queue, name, STREAM_TIMEOUT_SECONDS)
 
@@ -269,14 +294,7 @@ class P2PStreamer:
         # The RTSP push target's path MUST match the name _register_stream() just
         # registered with go2rtc (the camera's serial number - see StreamProvider.P2P
         # in eufy_security_api.camera, which every consumer already dials by serial
-        # number). A literal "video" here used to silently mismatch: go2rtc's RTSP
-        # server still answers ANNOUNCE/SETUP/RECORD with 200 for an unregistered
-        # stream name (protocol-layer code doesn't check), but internal/rtsp's own
-        # bookkeeping (streams.Get(name) returning nil) then skips ever calling
-        # conn.Handle() - the loop that actually reads the pushed RTP data - and
-        # closes the connection immediately instead. That produced the exact
-        # "handshake succeeds, then instant broken pipe" symptom chased all through
-        # 2026-08-27/28 across three different push-client implementations.
-        await asyncio.gather(
-            asyncio.to_thread(self._run, self.camera.video_queue, str(self.camera.serial_no))
-        )
+        # number).
+        name = str(self.camera.serial_no)
+        host, port = self._rtsp_host_port()
+        await asyncio.to_thread(self._run, self.camera.video_queue, name, host, port)
