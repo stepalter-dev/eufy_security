@@ -23,7 +23,8 @@ even though the HTTP response looks like success. When ffmpeg's ANNOUNCE then
 arrives, go2rtc's RTSP server (internal/rtsp/rtsp.go) finds no registered stream
 for that name and skips ever calling the code path that reads RTP off the
 socket, closing the connection right after RECORD's 200 OK instead. Fixed by
-registering with a self-referencing `src` (see `_register_stream` for detail).
+registering with a placeholder `src` (see `_register_stream` for detail - and
+why it deliberately isn't self-referencing).
 
 Historically (before either of the above) this integration pushed video via a raw
 HTTP POST to an `/api/stream` (singular) endpoint that doesn't exist on any current
@@ -86,17 +87,18 @@ class P2PStreamer:
         # failure (see module docstring).
         self.first_push_ok = False
         # Set once go2rtc's own stream registry actually shows our ffmpeg's pushed
-        # producer registered (producers list length >= 2: the self-referencing
-        # placeholder from _register_stream plus our ffmpeg's "external" push) -
-        # see _wait_for_producer_registered for why this, not first_push_ok, is
-        # the signal HA's own consumers should wait on before attaching.
+        # producer registered (producers list length >= 2: the placeholder from
+        # _register_stream plus our ffmpeg's "external" push) - see
+        # _wait_for_producer_registered for why this, not first_push_ok, is the
+        # signal HA's own consumers should wait on before attaching.
         self.announced_ok = False
         self._proc: subprocess.Popen | None = None
 
     # ---------------------------------------------------------------------
     # go2rtc /api/streams registration - reuses HA's own go2rtc session when
     # available (see Camera.set_go2rtc_client). See _register_stream for why
-    # a self-referencing `src` is required.
+    # a placeholder `src` is required, and why it deliberately isn't
+    # self-referencing.
     # ---------------------------------------------------------------------
 
     def _go2rtc_api_url(self, suffix: str = "") -> tuple[str, aiohttp.ClientSession | None]:
@@ -132,21 +134,44 @@ class P2PStreamer:
         byte-count EOF as real ffmpeg traffic - proving the closure was
         independent of any client-side timing, i.e. structural, not a race.
 
-        Fix: register with a self-referencing `src` (an RTSP pull URL pointing at
-        our own push endpoint for this same stream name). This satisfies
-        `HasProducer()`/`Validate()` so `New()` actually creates the *Stream* and
-        stores it in go2rtc's registry. The URL is never dialed at registration
-        time (go2rtc's producers are lazy - see internal/streams/stream.go
-        `NewProducer`); it's only used as a fallback if a consumer requests the
-        stream before our own RTSP push has ANNOUNCEd (in which case dialing
-        it just fails harmlessly, since nothing is listening on that exact path
-        as a producer yet). Once our ffmpeg pushes in, `AddProducer` registers
-        that connection as `external` alongside the lazy pull source.
+        Fix: register with a placeholder `src` so `HasProducer()`/`Validate()`
+        pass and `New()` actually creates and stores the *Stream* in go2rtc's
+        registry - go2rtc's `/api/streams` PUT refuses to create a stream with
+        zero sources (see above), so some syntactically-valid producer URL is
+        unavoidable here.
+
+        DELIBERATELY NOT self-referencing (2026-08-28, continued 9 - see Eufy
+        Integration Log): an earlier version of this fix pointed the
+        placeholder at our own push endpoint (`rtsp://{host}:{port}/{name}` -
+        go2rtc's own RTSP server, same stream name). That seemed safe from
+        reading go2rtc's producer code alone (`Dial()` is lazy, nothing gets
+        connected at registration time) - but missed that `Stream.AddConsumer`
+        (internal/streams/add_consumer.go) tries producers *in insertion
+        order*, and this placeholder is always inserted first (registered
+        here, before ffmpeg's ANNOUNCE adds the real "external" producer).
+        That means *every* consumer attach - including HA's own built-in
+        `Stream` component reading this exact RTSP URL - triggered a `Dial()`
+        of the placeholder first, which is a real outbound RTSP connection
+        back into go2rtc's own listener for the *same* stream name: a
+        self-referencing consumer request that recurses into `AddConsumer`
+        again, hitting the same placeholder again. This is the most likely
+        explanation for HA's `Stream` component timing out (~5s) reading a
+        stream that our own ffmpeg was, per the logs, actively pushing real
+        RTP into at the same time - the timeout was this recursive dial, not
+        a problem with the actual pushed data.
+
+        Using a placeholder that fails fast instead - an address nothing is
+        ever listening on - means `Dial()` gets a near-instant connection
+        refusal on every consumer attach (added latency of one failed TCP
+        connect, not a multi-second recursive hang), and the loop moves on to
+        the real "external" producer at index 1 immediately after.
         """
         url, shared_session = self._go2rtc_api_url()
         name = str(self.camera.serial_no)
-        host, port = self._rtsp_host_port()
-        self_src = f"rtsp://{host}:{port}/{name}"
+        # Port 1 (historically tcpmux) is about as safe a bet as any for
+        # "nothing is ever listening here" on a loopback address inside this
+        # container - see the DELIBERATELY NOT self-referencing note above.
+        placeholder_src = f"rtsp://127.0.0.1:1/{name}"
 
         async with contextlib.AsyncExitStack() as stack:
             session = shared_session or await stack.enter_async_context(aiohttp.ClientSession())
@@ -156,15 +181,15 @@ class P2PStreamer:
 
         async with contextlib.AsyncExitStack() as stack:
             session = shared_session or await stack.enter_async_context(aiohttp.ClientSession())
-            async with session.put(url, params={"name": name, "src": self_src}) as response:
+            async with session.put(url, params={"name": name, "src": placeholder_src}) as response:
                 result = response.status, await response.text()
                 _LOGGER.debug(f"_register_stream - put response {result}")
 
     async def _wait_for_producer_registered(self, name: str, timeout_seconds: float) -> bool:
         """Poll go2rtc's own stream info until our ffmpeg's pushed producer has
         actually landed in its registry (producers list length >= 2: the
-        self-referencing placeholder from _register_stream plus our ffmpeg's
-        "external" push, added via go2rtc's internal AddProducer on ANNOUNCE).
+        placeholder from _register_stream plus our ffmpeg's "external" push,
+        added via go2rtc's internal AddProducer on ANNOUNCE).
 
         This exists to close the highest-risk window of a real go2rtc v1.9.14
         upstream bug (see Eufy Integration Log, 2026-08-28 continued 8): a
