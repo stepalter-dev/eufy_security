@@ -8,7 +8,7 @@ from collections import deque
 import datetime
 import traceback
 
-from .const import MessageField, STREAM_TIMEOUT_SECONDS, STREAM_SLEEP_SECONDS, GO2RTC_RTSP_PORT
+from .const import MessageField, STREAM_TIMEOUT_SECONDS, STREAM_SLEEP_SECONDS, GO2RTC_RTSP_PORT, HA_MANAGED_GO2RTC_RTSP_PORT
 from .event import Event
 from .exceptions import CameraRTSPStreamNotEnabled, CameraRTSPStreamNotSupported
 from .p2p_streamer import P2PStreamer
@@ -58,6 +58,16 @@ class Camera(Device):
         self.config = config
         self.voices = voices
         self.image_last_updated = None
+
+        # Set via set_go2rtc_client() once HA's own embedded go2rtc instance is
+        # discovered (see custom_components.eufy_security.util.get_ha_go2rtc_client).
+        # None until then, meaning "use the legacy fixed ports" (see const.py).
+        self.go2rtc_session = None
+        self.go2rtc_base_url = None
+        # Set via set_ffmpeg_binary() from HA's own ffmpeg integration - the P2P
+        # streamer shells out to ffmpeg to push video into go2rtc (see
+        # eufy_security_api.p2p_streamer). Falls back to "ffmpeg" on PATH if unset.
+        self.ffmpeg_binary = None
 
         self.stream_future = None
         self.stream_checker = None
@@ -249,6 +259,27 @@ class Camera(Device):
         """Returns picture bytes in base64 format"""
         return bytearray(self.picture_base64["data"]["data"])
 
+    def set_go2rtc_client(self, session, base_url: str) -> None:
+        """Point this camera at HA's own embedded go2rtc instance (Unix socket +
+        correct auth already wired up), instead of the legacy fixed TCP ports.
+
+        `session`/`base_url` are None when HA's internal go2rtc client couldn't
+        be discovered (see custom_components.eufy_security.util.get_ha_go2rtc_client)
+        - in that case this camera keeps using the old fixed-port behavior, for
+        compatibility with a self-hosted go2rtc add-on still on those ports.
+        """
+        self.go2rtc_session = session
+        self.go2rtc_base_url = base_url
+        # Refresh stream_url with the now-known go2rtc RTSP port, if applicable -
+        # set_go2rtc_client() is called after __init__ already built stream_url
+        # once with the legacy port assumption.
+        if self.stream_provider == StreamProvider.P2P:
+            self.set_stream_provider(StreamProvider.P2P)
+
+    def set_ffmpeg_binary(self, binary: str) -> None:
+        """Point the P2P streamer at HA's own ffmpeg binary path."""
+        self.ffmpeg_binary = binary
+
     def set_stream_provider(self, stream_provider: StreamProvider) -> None:
         """Set stream provider for camera instance"""
         self.stream_provider = stream_provider
@@ -263,9 +294,13 @@ class Camera(Device):
             self.stream_url = url.replace("{rtsp_stream_url}", self.rtsp_stream_url)
 
         elif self.stream_provider == StreamProvider.P2P:
+            # HA's embedded go2rtc always listens for RTSP on a fixed port
+            # (18554) that's different from the legacy standalone add-on's
+            # (8554) - use whichever one is actually applicable.
+            rtsp_port = HA_MANAGED_GO2RTC_RTSP_PORT if self.go2rtc_session is not None else GO2RTC_RTSP_PORT
             url = url.replace("{serial_no}", str(self.serial_no))
             url = url.replace("{server_address}", str(self.config.rtsp_server_address))
-            url = url.replace("{server_port}", str(GO2RTC_RTSP_PORT))
+            url = url.replace("{server_port}", str(rtsp_port))
             self.stream_url = url
         _LOGGER.debug(f"url - {self.stream_provider} - {self.stream_url}")
 

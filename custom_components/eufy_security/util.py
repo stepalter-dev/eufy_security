@@ -1,9 +1,44 @@
 """Util functions for integration"""
 import logging
 
+from homeassistant.core import HomeAssistant
+
 from .const import MetadataFilter, PropertyToEntityDescription, DOMAIN, NAME
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
+
+
+def get_ha_go2rtc_client(hass: HomeAssistant):
+    """Return (session, base_url) for HA's own internal go2rtc instance, or
+    (None, None) if it can't be found.
+
+    HA (2023.4+) runs go2rtc embedded in Core, with an aiohttp ClientSession
+    that's already wired up to talk to it correctly - over its Unix domain
+    socket when no TCP API port is exposed, and with the right auth headers
+    when go2rtc's local_auth is on (which HA always sets). Reusing that
+    session, rather than guessing a TCP host:port ourselves, is the only way
+    to reliably reach go2rtc's API on a modern HA install: the RTSP port is a
+    fixed constant (see HA_MANAGED_GO2RTC_RTSP_PORT), but the API is
+    Unix-socket-only by default and its credentials are generated at random
+    per boot and never written to disk anywhere we could read them.
+
+    This reaches into a private (underscore-prefixed) attribute of HA core's
+    go2rtc integration because it exposes no public API for this - so it's
+    intentionally defensive and returns (None, None) on any failure instead
+    of raising, letting callers fall back to the legacy fixed-port behavior.
+    """
+    try:
+        from homeassistant.components.go2rtc import (  # pylint: disable=import-outside-toplevel
+            _DATA_GO2RTC,
+        )
+
+        go2rtc_config = hass.data.get(_DATA_GO2RTC)
+        if go2rtc_config is None:
+            return None, None
+        return go2rtc_config.session, go2rtc_config.url
+    except Exception as ex:  # pylint: disable=broad-except
+        _LOGGER.debug(f"get_ha_go2rtc_client - could not reach HA's internal go2rtc client - {ex}")
+        return None, None
 
 
 def get_properties_by_filter(metadata: dict, filtering: MetadataFilter) -> dict:
