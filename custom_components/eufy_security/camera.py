@@ -28,6 +28,7 @@ from .eufy_security_api.camera import (
 )
 from .eufy_security_api.metadata import Metadata
 from .eufy_security_api.util import wait_for_value_to_equal
+from .util import get_ha_go2rtc_client
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
@@ -35,9 +36,21 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     """Setup camera entities."""
     coordinator: EufySecurityDataUpdateCoordinator = hass.data[DOMAIN][COORDINATOR]
+
+    # Give every camera product a way to reach HA's own embedded go2rtc instance
+    # (Unix socket + correct auth) instead of guessing a legacy fixed TCP port
+    # that modern HA's go2rtc no longer listens on. See util.get_ha_go2rtc_client
+    # for why this is necessary; falls back to the old behavior if unavailable.
+    go2rtc_session, go2rtc_base_url = get_ha_go2rtc_client(hass)
+    # The P2P streamer shells out to ffmpeg to push video into go2rtc - give it HA's
+    # own ffmpeg binary path rather than assuming "ffmpeg" is on PATH.
+    ffmpeg_binary = hass.data[DATA_FFMPEG].binary
+
     product_properties = []
     for product in coordinator.devices.values():
         if product.is_camera is True:
+            product.set_go2rtc_client(go2rtc_session, go2rtc_base_url)
+            product.set_ffmpeg_binary(ffmpeg_binary)
             product_properties.append(Metadata.parse(product, {"name": "camera", "label": "Camera"}))
 
     entities = [EufySecurityCamera(coordinator, metadata) for metadata in product_properties]
@@ -114,6 +127,13 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
 
     async def _start_hass_streaming(self):
         await wait_for_value_to_equal(self.product.__dict__, "stream_status", StreamStatus.STREAMING)
+        if self.product.stream_provider == StreamProvider.P2P:
+            # Wait for our own RTSP-push producer to have actually gotten one access unit
+            # into go2rtc before letting HA's Stream (or the snapshot poll below) attach as
+            # a consumer. go2rtc appears to destabilize a freshly-ANNOUNCEd producer if a
+            # consumer connects before it's producing data - see Eufy Integration Log
+            # 2026-08-27 for how this was diagnosed.
+            await wait_for_value_to_equal(self.product.p2p_streamer.__dict__, "first_push_ok", True)
         await self._stop_hass_streaming()
         await self.async_create_stream()
         if self.stream is not None:
@@ -150,8 +170,19 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         _LOGGER.debug(f"image 1 - {self.is_streaming} - {self.stream}")
         if self.is_streaming is True:
-            with contextlib.suppress(asyncio.TimeoutError):
-                self._last_image = await asyncio.wait_for(self._get_image_from_stream_url(width, height), STREAM_TIMEOUT_SECONDS)
+            if self.stream is not None:
+                # Reuse HA's own already-connected Stream instead of opening a brand new
+                # ffmpeg RTSP consumer on every poll (HA polls camera images roughly every
+                # 0.5-1s while streaming). That churn of short-lived consumers connecting
+                # and disconnecting against the same go2rtc stream our own RTSP push is
+                # using appears to be what destabilizes the push connection - see Eufy
+                # Integration Log 2026-08-27. HA's Stream already has a persistent
+                # connection and can hand back a cached/decoded keyframe locally.
+                with contextlib.suppress(Exception):
+                    self._last_image = await self.stream.async_get_image(width=width, height=height)
+            if self._last_image is None:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    self._last_image = await asyncio.wait_for(self._get_image_from_stream_url(width, height), STREAM_TIMEOUT_SECONDS)
             _LOGGER.debug(f"image 2 - is_empty {self._last_image is None}")
 
         _LOGGER.debug(f"async_camera_image 5 - is_empty {self._last_image is None}")

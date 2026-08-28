@@ -12,9 +12,19 @@ UNSUPPORTED = "Unsupported"
 
 STREAM_TIMEOUT_SECONDS = 15
 STREAM_SLEEP_SECONDS = 0.25
+# Legacy fixed ports from the old standalone go2rtc add-on. HA's embedded go2rtc
+# (2023.4+) no longer listens on these: its RTSP port is fixed at 18554 and its
+# HTTP API is Unix-socket-only unless a URL/debug_ui is manually configured.
+# Kept only as a last-resort fallback when HA's internal go2rtc client can't be
+# discovered (see util.get_ha_go2rtc_client) - e.g. a self-hosted go2rtc add-on
+# still using the old fixed ports.
 GO2RTC_RTSP_PORT = 8554
 GO2RTC_API_PORT = 1984
 GO2RTC_API_URL = "http://{0}:{1}/api/stream"
+# Fixed RTSP port HA's embedded go2rtc has used since it started managing go2rtc
+# itself (homeassistant/components/go2rtc/server.py - hardcoded in the config
+# template HA writes for go2rtc, not configurable).
+HA_MANAGED_GO2RTC_RTSP_PORT = 18554
 
 
 class MessageField(Enum):
