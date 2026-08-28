@@ -205,16 +205,39 @@ class EufySecurityCamera(Camera, EufySecurityEntity):
         the whole reason P2P sessions are gated behind on/off in the first
         place (Eufy's cloud/P2P livestream is a real, limited resource, not a
         free-running feed). See Eufy Integration Log, 2026-08-28 (continued 12).
+
+        Deliberately does NOT await the actual startup (async_turn_on can take
+        several real seconds - P2P wake-up, ffmpeg, the RTSP handshake, go2rtc
+        registration) - it only kicks that off as a background task and returns
+        immediately. The first version of this awaited it directly, which made
+        the very first async_camera_image() call for a freshly-opened dashboard
+        dialog hang for that whole multi-second chain before responding at all;
+        the frontend ended up rendering the dialog in a broken, narrow layout
+        that only fixed itself on closing and reopening (by which point the
+        camera was already on and the request returned fast). Returning
+        immediately here means that first request still serves whatever's in
+        `self._last_image` (a cached snapshot, sized correctly), and HA's own
+        repeated polling of async_camera_image() - already how the live feed
+        works, see handle_async_mjpeg_stream - naturally picks up real live
+        frames a few seconds later once `is_streaming` flips true, with no
+        separate close/reopen needed. See Eufy Integration Log, 2026-08-28
+        (continued 13).
         """
         if self.is_streaming:
             return
         if width is not None and width < self._AUTO_START_MIN_WIDTH:
             return
-        async with self._auto_start_lock:
-            if self.is_streaming:  # another concurrent call may have started it already
-                return
-            _LOGGER.debug(f"_ensure_streaming_for_view - auto-starting (width={width})")
-            await self.async_turn_on()
+        if self._auto_start_lock.locked():
+            return  # already starting in the background - don't duplicate
+
+        async def _start_in_background() -> None:
+            async with self._auto_start_lock:
+                if self.is_streaming:  # another call may have started it already
+                    return
+                _LOGGER.debug(f"_ensure_streaming_for_view - auto-starting (width={width})")
+                await self.async_turn_on()
+
+        self.hass.async_create_task(_start_in_background())
 
     async def _get_image_from_stream_url(self, width, height):
         while True:
