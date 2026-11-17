@@ -61,13 +61,21 @@ class WebSocketClient:
 
     async def _process_messages(self):
         async for msg in self.socket:
+            if msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
+                # msg.data isn't a JSON text payload here, so calling _on_message()
+                # would blow up in message.json(). Exit cleanly so _on_close can
+                # reconnect instead.
+                _LOGGER.warning(f"websocket client received {msg.type} frame, exiting message loop")
+                break
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
             await self._on_message(msg)
 
     async def _on_message(self, message):
         try:
             if self.message_callback is not None:
                 await self.message_callback(message.json())
-        except:
+        except Exception:
             traceback.print_exc()
 
     async def _on_error(self, error: Text = "Unspecified") -> None:
